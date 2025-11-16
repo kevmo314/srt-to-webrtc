@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -13,8 +14,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/asticode/go-astits"
 	"github.com/haivision/srtgo"
 	"github.com/pion/rtp"
+	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -39,8 +42,9 @@ func main() {
 	log.Printf("starting SRT listener on :%d", port)
 
 	opts := map[string]string{
-		"messageapi": "1", // Ensure we preserve RTP packet boundaries.
-		"blocking":   "1",
+		"messageapi":  "1", // Use message API for chunked TS packets.
+		"blocking":    "1",
+		"payloadsize": "1316",
 	}
 	listener := srtgo.NewSrtSocket("0.0.0.0", uint16(port), opts)
 	if listener == nil {
@@ -69,119 +73,93 @@ func readPort() int {
 	return defaultPort
 }
 
-func handleConnection(conn *srtgo.SrtSocket, addr *net.UDPAddr, whipURL string) {
+type srtConn interface {
+	Read([]byte) (int, error)
+	PacketSize() int
+	GetSockOptString(opt int) (string, error)
+	Close()
+}
+
+func handleConnection(conn srtConn, addr *net.UDPAddr, whipURL string) {
 	defer conn.Close()
 
 	streamID, _ := conn.GetSockOptString(srtgo.SRTO_STREAMID)
 	streamKey := deriveStreamKey(streamID)
 	log.Printf("accepted SRT from %s streamid=%q streamKey=%q", addr.String(), strings.TrimSpace(streamID), streamKey)
 
-	// Read the first RTP packet so we can infer codec parameters.
-	firstBuf := make([]byte, defaultBufferSize)
-	n, err := conn.Read(firstBuf)
-	if err != nil {
-		log.Printf("failed reading initial packet from %s: %v", addr.String(), err)
-		return
-	}
-	firstPkt := &rtp.Packet{}
-	if err := firstPkt.Unmarshal(firstBuf[:n]); err != nil {
-		log.Printf("failed to parse RTP from %s: %v", addr.String(), err)
-		return
-	}
-
-	codec, codecType, err := codecForPacket(firstPkt)
-	if err != nil {
-		log.Printf("could not determine codec for %s: %v", addr.String(), err)
-		return
-	}
-
-	pc, track, err := createPeerConnection(codec, codecType, streamKey)
-	if err != nil {
-		log.Printf("failed to build WebRTC transport for %s: %v", addr.String(), err)
-		return
-	}
-	defer pc.Close()
-
-	offer, err := pc.CreateOffer(nil)
-	if err != nil {
-		log.Printf("failed to create offer: %v", err)
-		return
-	}
-
-	gatherComplete := webrtc.GatheringCompletePromise(pc)
-	if err := pc.SetLocalDescription(offer); err != nil {
-		log.Printf("failed to set local description: %v", err)
-		return
-	}
-	<-gatherComplete
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	answer, err := sendWhipOffer(ctx, whipURL, streamKey, pc.LocalDescription().SDP)
-	if err != nil {
-		log.Printf("failed to publish WHIP session: %v", err)
-		return
-	}
-	if err := pc.SetRemoteDescription(answer); err != nil {
-		log.Printf("failed to set remote description: %v", err)
-		return
-	}
-
-	connected := make(chan struct{})
-	failed := make(chan struct{})
-	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		if state == webrtc.PeerConnectionStateConnected {
-			select {
-			case <-connected:
-			default:
-				close(connected)
+	// Bridge SRT messages into a continuous stream for the TS demuxer.
+	pr, pw := io.Pipe()
+	go func() {
+		defer pw.Close()
+		bufSize := conn.PacketSize()
+		if bufSize < 1316 {
+			bufSize = 1316
+		}
+		buf := make([]byte, bufSize)
+		for {
+			n, err := conn.Read(buf)
+			if n > 0 {
+				if _, werr := pw.Write(buf[:n]); werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				_ = pw.CloseWithError(err)
+				return
 			}
 		}
-		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateDisconnected || state == webrtc.PeerConnectionStateClosed {
-			select {
-			case <-failed:
-			default:
-				close(failed)
-			}
-		}
-	})
+	}()
 
-	select {
-	case <-connected:
-	case <-failed:
-		log.Printf("webRTC connection failed for stream %q", streamKey)
-		return
-	}
+	demux := astits.NewDemuxer(context.Background(), pr)
+	streamTypes := map[uint16]astits.StreamType{}
+	var pipe *pipeline
 
-	log.Printf("stream %q forwarding to WHIP %s as %s", streamKey, whipURL, codec.RTPCodecCapability.MimeType)
-
-	rtpSize := defaultBufferSize
-	if rtpSize < conn.PacketSize() {
-		rtpSize = conn.PacketSize()
-	}
-
-	// Forward the first packet that we used for sniffing.
-	if err := track.WriteRTP(firstPkt); err != nil {
-		log.Printf("failed to forward first packet: %v", err)
-		return
-	}
-
-	buf := make([]byte, rtpSize)
 	for {
-		n, err := conn.Read(buf)
+		data, err := demux.NextData()
 		if err != nil {
-			log.Printf("read error for stream %q: %v", streamKey, err)
-			break
+			if err != io.EOF {
+				log.Printf("demux error for stream %q: %v", streamKey, err)
+			}
+			return
 		}
-		pkt := &rtp.Packet{}
-		if err := pkt.Unmarshal(buf[:n]); err != nil {
-			log.Printf("invalid RTP packet for stream %q: %v", streamKey, err)
+		if data == nil {
 			continue
 		}
-		if err := track.WriteRTP(pkt); err != nil {
-			log.Printf("failed to write RTP for stream %q: %v", streamKey, err)
-			break
+		if data.PMT != nil {
+			for _, es := range data.PMT.ElementaryStreams {
+				streamTypes[es.ElementaryPID] = es.StreamType
+			}
+			log.Printf("stream %q PMT parsed, streams=%d", streamKey, len(streamTypes))
+			continue
+		}
+		if data.PES == nil {
+			continue
+		}
+		st, ok := streamTypes[data.PID]
+		if !ok {
+			continue
+		}
+		log.Printf("stream %q received PES pid=%d type=%v bytes=%d", streamKey, data.PID, st, len(data.PES.Data))
+
+		if pipe == nil {
+			var err error
+			pipe, err = startPipeline(st, streamKey, whipURL)
+			if err != nil {
+				log.Printf("failed to start pipeline for %q: %v", streamKey, err)
+				return
+			}
+			log.Printf("stream %q forwarding to WHIP %s as %s", streamKey, whipURL, pipe.codec.RTPCodecCapability.MimeType)
+		}
+
+		pts := pipe.nextPTS
+		if oh := data.PES.Header.OptionalHeader; oh != nil && oh.PTS != nil {
+			if oh.PTS.Base > 0 {
+				pts = uint64(oh.PTS.Base)
+			}
+		}
+		if err := pipe.writeSample(data.PES.Data, pts); err != nil {
+			log.Printf("failed to forward sample for %q: %v", streamKey, err)
+			return
 		}
 	}
 }
@@ -200,55 +178,7 @@ func deriveStreamKey(streamID string) string {
 	return s
 }
 
-func codecForPacket(pkt *rtp.Packet) (webrtc.RTPCodecParameters, webrtc.RTPCodecType, error) {
-	var cap webrtc.RTPCodecCapability
-	codecType := webrtc.RTPCodecTypeVideo
-	switch pkt.PayloadType {
-	case 111, 110:
-		cap = webrtc.RTPCodecCapability{
-			MimeType:  webrtc.MimeTypeOpus,
-			ClockRate: 48000,
-			Channels:  2,
-		}
-		codecType = webrtc.RTPCodecTypeAudio
-	case 96, 97, 98, 127:
-		if isLikelyH264(pkt.Payload) {
-			cap = webrtc.RTPCodecCapability{
-				MimeType:  webrtc.MimeTypeH264,
-				ClockRate: 90000,
-			}
-		} else {
-			cap = webrtc.RTPCodecCapability{
-				MimeType:  webrtc.MimeTypeVP8,
-				ClockRate: 90000,
-			}
-		}
-	default:
-		if isLikelyH264(pkt.Payload) {
-			cap = webrtc.RTPCodecCapability{
-				MimeType:  webrtc.MimeTypeH264,
-				ClockRate: 90000,
-			}
-		} else {
-			return webrtc.RTPCodecParameters{}, codecType, fmt.Errorf("unknown codec payload type %d", pkt.PayloadType)
-		}
-	}
-
-	return webrtc.RTPCodecParameters{
-		RTPCodecCapability: cap,
-		PayloadType:        webrtc.PayloadType(pkt.PayloadType),
-	}, codecType, nil
-}
-
-func isLikelyH264(payload []byte) bool {
-	if len(payload) == 0 {
-		return false
-	}
-	nalType := payload[0] & 0x1F
-	return nalType > 0 && nalType < 24
-}
-
-func createPeerConnection(codec webrtc.RTPCodecParameters, codecType webrtc.RTPCodecType, streamKey string) (*webrtc.PeerConnection, *webrtc.TrackLocalStaticRTP, error) {
+func createPeerConnection(codec webrtc.RTPCodecParameters, codecType webrtc.RTPCodecType, streamKey string) (*webrtc.PeerConnection, trackWriter, error) {
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterCodec(codec, codecType); err != nil {
 		return nil, nil, fmt.Errorf("register codec: %w", err)
@@ -313,4 +243,185 @@ func sendWhipOffer(ctx context.Context, whipURL, streamKey, offerSDP string) (we
 		SDP:  string(body),
 	}
 	return answer, nil
+}
+
+type pipeline struct {
+	pc        *webrtc.PeerConnection
+	track     trackWriter
+	payloader rtp.Payloader
+	codec     webrtc.RTPCodecParameters
+	codecType webrtc.RTPCodecType
+	clockRate uint32
+	seq       uint16
+	ssrc      uint32
+	basePTS   uint64
+	started   bool
+	nextPTS   uint64
+}
+
+var pipelineFactory func(astits.StreamType, string, string) (*pipeline, error)
+
+type trackWriter interface {
+	WriteRTP(*rtp.Packet) error
+}
+
+func startPipeline(st astits.StreamType, streamKey, whipURL string) (*pipeline, error) {
+	if pipelineFactory != nil {
+		return pipelineFactory(st, streamKey, whipURL)
+	}
+	var (
+		codec     webrtc.RTPCodecParameters
+		codecType webrtc.RTPCodecType
+		payloader rtp.Payloader
+		clockRate uint32
+	)
+	switch st {
+	case astits.StreamTypeH264Video:
+		codec = webrtc.RTPCodecParameters{
+			RTPCodecCapability: webrtc.RTPCodecCapability{
+				MimeType:  webrtc.MimeTypeH264,
+				ClockRate: 90000,
+			},
+			PayloadType: 102,
+		}
+		codecType = webrtc.RTPCodecTypeVideo
+		payloader = &codecs.H264Payloader{}
+		clockRate = 90000
+	default:
+		return nil, fmt.Errorf("unsupported stream type %v", st)
+	}
+
+	pc, track, err := createPeerConnection(codec, codecType, streamKey)
+	if err != nil {
+		return nil, err
+	}
+
+	offer, err := pc.CreateOffer(nil)
+	if err != nil {
+		pc.Close()
+		return nil, err
+	}
+
+	gatherComplete := webrtc.GatheringCompletePromise(pc)
+	if err := pc.SetLocalDescription(offer); err != nil {
+		pc.Close()
+		return nil, err
+	}
+	<-gatherComplete
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	answer, err := sendWhipOffer(ctx, whipURL, streamKey, pc.LocalDescription().SDP)
+	if err != nil {
+		pc.Close()
+		return nil, err
+	}
+	if err := pc.SetRemoteDescription(answer); err != nil {
+		pc.Close()
+		return nil, err
+	}
+
+	connected := make(chan struct{})
+	failed := make(chan struct{})
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		log.Printf("webrtc state %s", state)
+		if state == webrtc.PeerConnectionStateConnected {
+			select {
+			case <-connected:
+			default:
+				close(connected)
+			}
+		}
+		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateDisconnected || state == webrtc.PeerConnectionStateClosed {
+			select {
+			case <-failed:
+			default:
+				close(failed)
+			}
+		}
+	})
+
+	select {
+	case <-connected:
+	case <-failed:
+		pc.Close()
+		return nil, fmt.Errorf("webRTC connection failed")
+	}
+
+	return &pipeline{
+		pc:        pc,
+		track:     track,
+		payloader: payloader,
+		codec:     codec,
+		codecType: codecType,
+		clockRate: clockRate,
+		seq:       uint16(rand.Uint32()),
+		ssrc:      rand.Uint32(),
+	}, nil
+}
+
+func (p *pipeline) writeSample(payload []byte, pts uint64) error {
+	if !p.started {
+		p.basePTS = pts
+		p.started = true
+	}
+	if pts == 0 {
+		pts = p.basePTS + uint64(p.clockRate/30)
+	}
+	ts := uint32((pts - p.basePTS) & 0xFFFFFFFF)
+	nalus := splitAnnexBNalus(payload)
+	for _, nalu := range nalus {
+		if len(nalu) == 0 {
+			continue
+		}
+		packets := p.payloader.Payload(1200, nalu)
+		for _, pl := range packets {
+			p.seq++
+			pkt := &rtp.Packet{
+				Header: rtp.Header{
+					Version:        2,
+					SequenceNumber: p.seq,
+					Timestamp:      ts,
+					SSRC:           p.ssrc,
+					PayloadType:    uint8(p.codec.PayloadType),
+				},
+				Payload: pl,
+			}
+			if err := p.track.WriteRTP(pkt); err != nil {
+				return err
+			}
+		}
+	}
+	p.nextPTS = pts + uint64(p.clockRate/30)
+	return nil
+}
+
+func splitAnnexBNalus(b []byte) [][]byte {
+	var out [][]byte
+	i := 0
+	for i < len(b) {
+		if i+3 < len(b) && b[i] == 0x00 && b[i+1] == 0x00 && ((b[i+2] == 0x01) || (b[i+2] == 0x00 && b[i+3] == 0x01)) {
+			j := i + 3
+			if b[i+2] == 0x00 {
+				j = i + 4
+			}
+			start := j
+			i = j
+			for i+3 < len(b) {
+				if b[i] == 0x00 && b[i+1] == 0x00 && ((b[i+2] == 0x01) || (b[i+2] == 0x00 && b[i+3] == 0x01)) {
+					break
+				}
+				i++
+			}
+			if i+3 >= len(b) {
+				out = append(out, b[start:])
+			} else {
+				out = append(out, b[start:i])
+			}
+		} else {
+			i++
+		}
+	}
+	return out
 }

@@ -1,6 +1,6 @@
 # srt-to-webrtc
 
-Minimal SRT-to-WHIP forwarder written in Go. Listens for SRT (message API) on `PORT` or `7000`, sniffs incoming RTP, and forwards via WHIP using the SRT streamid as the bearer token.
+Minimal SRT-to-WHIP forwarder written in Go. Listens for SRT (message API) on `PORT` or `7000`, demuxes inbound MPEG-TS (e.g., H.264) and forwards via WHIP using the SRT streamid as the bearer token.
 
 ## Requirements
 - Go 1.25+

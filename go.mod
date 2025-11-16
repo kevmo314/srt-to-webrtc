@@ -3,12 +3,14 @@ module github.com/kevmo314/srt-to-webrtc
 go 1.25.0
 
 require (
+	github.com/asticode/go-astits v1.14.0
 	github.com/haivision/srtgo v0.0.0-20230627061225-a70d53fcd618
 	github.com/pion/rtp v1.8.25
 	github.com/pion/webrtc/v4 v4.1.6
 )
 
 require (
+	github.com/asticode/go-astikit v0.30.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-pointer v0.0.1 // indirect
 	github.com/pion/datachannel v1.5.10 // indirect
